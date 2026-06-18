@@ -132,8 +132,40 @@ class FrameShiftGUI:
         help_menu.add_command(label="Quick Guide", command=self.show_quick_guide)
         menubar.add_cascade(label="Help", menu=help_menu)
 
-        main_frame = ttk.Frame(master, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # Scrollable container: the settings don't always fit the window
+        # (small screens, or many object-detection rows), so the whole content
+        # area lives inside a Canvas that can scroll vertically.
+        outer_frame = ttk.Frame(master)
+        outer_frame.pack(fill=tk.BOTH, expand=True)
+        self.main_canvas = tk.Canvas(outer_frame, highlightthickness=0)
+        vscrollbar = ttk.Scrollbar(outer_frame, orient=tk.VERTICAL, command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=vscrollbar.set)
+        vscrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main_frame = ttk.Frame(self.main_canvas, padding="10")
+        self._main_window_id = self.main_canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+        def _on_main_frame_configure(event):
+            # Keep the scrollable region matched to the content height.
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+        main_frame.bind("<Configure>", _on_main_frame_configure)
+
+        def _on_main_canvas_configure(event):
+            # Stretch the inner frame to the canvas width so widgets fill it.
+            self.main_canvas.itemconfigure(self._main_window_id, width=event.width)
+        self.main_canvas.bind("<Configure>", _on_main_canvas_configure)
+
+        def _on_mousewheel(event):
+            if event.num == 4:        # Linux scroll up
+                self.main_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:      # Linux scroll down
+                self.main_canvas.yview_scroll(1, "units")
+            else:                     # Windows / macOS
+                self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self.main_canvas.bind_all("<Button-4>", _on_mousewheel)
+        self.main_canvas.bind_all("<Button-5>", _on_mousewheel)
 
         io_frame = ttk.LabelFrame(main_frame, text="Input & Output", padding="10")
         io_frame.pack(fill=tk.X, expand=False, pady=5)

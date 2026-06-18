@@ -11,3 +11,9 @@ models/
 
 # Editor / backup artifacts
 *.bak
+
+# Build artifacts
+build_venv/
+build/
+dist/
+*.spec

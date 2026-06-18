@@ -1,148 +1,196 @@
-# FrameShift
-<p align="left">
-  <img src="img/icon.png" alt="icon" style="width:25%;">
-</p>
-FrameShift is an open source implementation inspired by Google AutoFlip. It automatically reframes
-videos to a target aspect ratio while keeping faces and objects in view.
+<a id="readme-top"></a>
 
-## Features
+<div align="center">
+  <img src="img/icon.png" alt="FrameShift logo" width="120">
 
-- Shot detection using PySceneDetect
-- Face detection with MediaPipe
-- Object detection using YOLO (Ultralytics)
-- Smooth camera path optimization to avoid jitter
-- Output encoded with OpenCV
+  <h1>FrameShift</h1>
 
-## Installation
+  <p><strong>Reframe landscape video to vertical (or any aspect ratio) while keeping faces and objects in shot.</strong></p>
 
-1.  **Install Python Dependencies:**
-    The script requires Python 3.8+ and the packages listed in `requirements.txt`.
-    ```bash
-    pip install -r requirements.txt
-    ```
+  <p>An open-source take on <a href="https://github.com/google/mediapipe/blob/master/docs/solutions/autoflip.md">Google AutoFlip</a>: detect what matters in each scene, crop around it, keep the audio.</p>
 
-2.  **Install FFmpeg (for audio processing):**
-    FrameShift uses FFmpeg to process and include audio from the original video into the reframed output. If FFmpeg is not installed or not found in your system's PATH, the script will still process the video but the output will not contain audio (a warning will be displayed).
-    *   **Download FFmpeg:** You can download FFmpeg from [ffmpeg.org](https://ffmpeg.org/download.html).
-    *   **Installation:** Follow the installation instructions for your operating system. Ensure the directory containing the `ffmpeg` (or `ffmpeg.exe`) executable is added to your system's PATH environment variable.
-    *   **Verify Installation:** Open a new terminal/command prompt and type `ffmpeg -version`. If it's installed correctly, you should see version information.
+  [![License: MIT][license-shield]][license-url]
+  [![Python][python-shield]][python-url]
+  [![Last commit][last-commit-shield]][last-commit-url]
+  [![Stars][stars-shield]][stars-url]
+  [![Issues][issues-shield]][issues-url]
 
-## Quick Start: Usage Examples
+</div>
 
-FrameShift automatically reframes videos, using a stationary (fixed) crop for each detected scene.
+<!-- Add a demo GIF here once recorded:
+  <p align="center"><img src="img/demo.gif" alt="FrameShift demo" width="720"></p>
+-->
 
-**1. Default Behavior: Fill Frame (Pan & Scan)**
-   Converts a landscape video to portrait, filling the new 9:16 frame by cropping and centering.
-   ```bash
-   python -m frameshift.main my_landscape_video.mp4 video_for_stories.mp4 --ratio 9:16
-   ```
+## Contents
 
-**2. Padding with Black Bars:**
-   If you want to see the entire optimally cropped region without parts being cut off to fill the frame, use `--padding`. This will add black bars by default.
-   ```bash
-   python -m frameshift.main input_video.mp4 square_video_fit.mp4 --ratio 1:1 --padding
-   ```
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Quick start (CLI)](#quick-start-cli)
+- [GUI](#gui)
+- [Command-line options](#command-line-options)
+- [Object weights](#object-weights)
+- [Limitations](#limitations)
+- [Contributing](#contributing)
+- [License](#license)
 
-**3. Padding with Blurred Background:**
-   To use blurred background bars instead of black:
-   ```bash
-   python -m frameshift.main input_video.mp4 output_blur_padded.mp4 --ratio 16:9 --padding --padding_type blur --blur_amount 5
-   ```
-   *(Adjust `--blur_amount` from 0 (minimal) to 10 (maximal) for desired blur intensity.)*
+## What it does
 
-**4. Padding with a Custom Color:**
-   To use solid green bars:
-   ```bash
-   python -m frameshift.main input_video.mp4 output_color_padded.mp4 --ratio 4:3 --padding --padding_type color --padding_color_value green
-   ```
-   Or with a specific RGB color (e.g., blue):
-   ```bash
-   python -m frameshift.main input_video.mp4 output_rgb_padded.mp4 --ratio 4:3 --padding --padding_type color --padding_color_value "(0,0,255)"
-   ```
+FrameShift takes a video, splits it into scenes, finds the faces and objects in each scene, then picks one fixed crop per scene that keeps the important content inside a target frame (9:16 for Reels/Shorts, 1:1 for square, anything you ask for). The original audio is muxed back in with FFmpeg.
 
-**5. Batch Processing:**
-   Reframes all videos in `my_video_folder` to 4:5, saving to `output_folder`, using default fill behavior.
-   ```bash
-   python -m frameshift.main my_video_folder/ output_folder/ --ratio 4:5 --batch
-   ```
+The crop is **stationary per scene** — one crop box held for the whole shot, recomputed at each cut. There's no panning or object tracking within a shot. That keeps the output stable and predictable; it also means fast subject movement inside a single long take can drift out of frame. See [Limitations](#limitations).
 
-**6. Running the Test Suite:**
-   To run a predefined suite of tests using `my_video.mp4` as input, saving test outputs relative to `test_run_output.mp4`, and generating a detailed log:
-   ```bash
-   python -m frameshift.main my_video.mp4 test_run_output.mp4 --ratio 16:9 --test
-   ```
-   *(Check `test_run_output_test_outputs/` directory and `test_run_output_test_suite.log` or similar for results. If an error occurs in one test scenario, the suite will log it and continue to the next.)*
+Models download themselves on first run into a local `models/` folder. Each file is checked against a pinned SHA-256 before it's loaded — a `.pt` is a pickle archive, so loading an unverified one would run whatever code it carries. A file that fails the check is deleted, not loaded.
 
-## How FrameShift Works (Inspired by Google AutoFlip)
+- **Faces** — `yolov11n-face.pt` ([akanametov/yolo-face](https://github.com/akanametov/yolo-face)), with MediaPipe Face Detection as a fallback if the YOLO model won't load.
+- **Objects** — `yolo11n.pt` (Ultralytics, 80 COCO classes). Only loaded when you ask for a non-face object weight > 0, so face-only runs stay light.
 
-FrameShift intelligently reframes videos using a **stationary (fixed) crop per scene** approach:
+## How it works
 
-1.  **Scene Detection:** Divides the video into scenes using PySceneDetect.
-2.  **Content Analysis:**
-    Both detection models (`yolo11n.pt` and `yolov11n-face.pt`) are automatically downloaded to a local `models/` subdirectory if not found during the first run.
-    *   **Faces:** Detected using a specialized model, `yolov11n-face.pt`.
-        *   This model is trained to detect one primary class: `{0: 'face'}`.
-        *   If this model fails to load or operate, MediaPipe's face detection is used as a fallback.
-    *   **Other Objects:** Detected using the general-purpose `yolo11n.pt` model.
-        *   This model can identify a wide range of objects from the COCO dataset. Common detectable classes include: `person`, `bicycle`, `car`, `motorcycle`, `airplane`, `bus`, `train`, `truck`, `boat`, `traffic light`, `fire hydrant`, `stop sign`, `parking meter`, `bench`, `bird`, `cat`, `dog`, `horse`, `sheep`, `cow`, `elephant`, `bear`, `zebra`, `giraffe`, `backpack`, `umbrella`, `handbag`, `tie`, `suitcase`, `frisbee`, `skis`, `snowboard`, `sports ball`, `kite`, `baseball bat`, `baseball glove`, `skateboard`, `surfboard`, `tennis racket`, `bottle`, `wine glass`, `cup`, `fork`, `knife`, `spoon`, `bowl`, `banana`, `apple`, `sandwich`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake`, `chair`, `couch`, `potted plant`, `bed`, `dining table`, `toilet`, `tv`, `laptop`, `mouse`, `remote`, `keyboard`, `cell phone`, `microwave`, `oven`, `toaster`, `sink`, `refrigerator`, `book`, `clock`, `vase`, `scissors`, `teddy bear`, `hair drier`, `toothbrush`. (This is not an exhaustive list, but covers the 80 standard COCO classes).
-        *   This object detection step is performed *only if* you specify weights for object classes (other than 'face' and 'default') with a weight greater than 0 in the `--object_weights` argument. This optimizes performance when only face-centric reframing is needed.
-    *   The importance of all detected elements in guiding the crop is determined by the `--object_weights` argument.
-3.  **Optimal Stationary Crop:** For each scene, calculates a fixed crop window that best frames the weighted area of interest at the target aspect ratio.
-4.  **Output Generation (Cropping/Padding):**
-    *   **Default (Fill/Pan & Scan):** If `--padding` is NOT specified, the determined crop is scaled to completely fill the output frame. Excess parts of the crop are trimmed to match the target aspect ratio without deforming the image. No bars are added.
-    *   **With Padding (`--padding` is specified):** The determined crop is scaled to fit entirely *within* the output frame, preserving its aspect ratio.
-        *   If `--padding_type` is `black` (default when `--padding` is used) or an unrecognized type: Black bars are added.
-        *   If `--padding_type` is `blur`: Blurred bars from the original video background are added. Intensity is controlled by `--blur_amount`.
-        *   If `--padding_type` is `color`: Bars of the color specified by `--padding_color_value` are added.
-    The script will attempt to preserve the audio track from the original video using FFmpeg. If FFmpeg is not found, the output video will be silent.
+1. **Scene detection** — PySceneDetect (`ContentDetector`) finds the cuts.
+2. **Sampling** — up to 150 frames per scene are run through the detector.
+3. **Weighted interest region** — every detection contributes to a centroid weighted by its `--object_weights` value and its area; the union of the boxes sets the size.
+4. **Crop** — that region is expanded to the target aspect ratio and clamped to the frame.
+5. **Render** — the crop fills the output (pan & scan), or fits inside it with padding (black / blurred / solid colour).
+6. **Audio** — FFmpeg copies the original track onto the reframed video. No FFmpeg, no audio (you get a warning, the video still renders).
 
-**Future Development Ideas:**
-Enhancements could include automatic selection of reframing strategies (like dynamic tracking or panning) and more advanced path smoothing.
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-## Command-line Options
+## Install
 
-*   `input`: Path to the input video file or input directory (if `--batch` is used).
-*   `output`: Path to the output video file or output directory (if `--batch` is used).
-*   `--ratio R`: Target aspect ratio for the output video (e.g., `9:16`, `1:1`, or `0.5625`). Default: `9/16`.
-*   `--padding`: (Flag, default: `False`) If set, enables padding to ensure the entire optimally cropped content is visible. Defaults to black bars if no other padding type is specified. If not set, the content will be cropped to fill the output frame (Pan & Scan).
-*   `--padding_type TYPE`: (Default: `black`) Type of padding if `--padding` is enabled.
-    *   `black`: Solid black bars.
-    *   `blur`: Blurred background bars.
-    *   `color`: Solid color bars (use with `--padding_color_value`).
-*   `--blur_amount INT`: (Default: `5`) Integer from 0 (minimal) to 10 (maximal) for blur intensity when `padding_type` is `blur`.
-*   `--padding_color_value STR`: (Default: `black`) Color for padding if `padding_type` is `color`.
-    *   Accepts names: `black`, `white`, `red`, `green`, `blue`, `yellow`, `cyan`, `magenta`.
-    *   Accepts RGB tuple as string: `"(R,G,B)"` (e.g., `"(255,0,0)"` for red).
-*   `--output_height H`: (Default: `1080`, integer) Target height for the output video in pixels (e.g., 720, 1080, 1280, 1920). The width will be calculated automatically based on the target aspect ratio specified by `--ratio`. This allows control over the final output resolution.
-*   `--interpolation METHOD`: (Default: `lanczos`) Specifies the interpolation algorithm used for resizing video frames.
-    *   Choices: `nearest`, `linear`, `cubic`, `area`, `lanczos`.
-    *   `lanczos` (Lanczos over 8x8 neighborhood) or `cubic` are generally recommended for upscaling (enlarging images) as they can produce sharper results.
-    *   `area` is often best for downscaling (shrinking images).
-    *   `linear` is faster but might be less sharp than `cubic` or `lanczos`.
-    *   `nearest` is the fastest but produces blocky results, usually not recommended for video.
-*   `--content_opacity O`: (Default: `1.0`) Opacity of the main video content (0.0-1.0). If < 1.0, the content (including any padding) is blended with a blurred version of the full original frame.
-*   `--object_weights "label:w,..."`: (Default: `"face:1.0,person:0.8,default:0.5"`) Comma-separated `label:weight` pairs.
-    *   Assigns importance weights to detected elements. The label `'face'` refers to faces detected by `yolov11n-face.pt` (or MediaPipe fallback). Other labels (e.g., `'person'`, `'car'`, `'dog'`, see list under "Content Analysis") correspond to objects detected by `yolo11n.pt`.
-    *   Detection of these other objects with `yolo11n.pt` is only run if weights are specified for their labels with a weight > 0.
-    *   Example: `"--object_weights \"face:1.0,dog:0.7,default:0.2\""` (this would trigger `yolo11n.pt` to look for dogs).
-*   `--log_file FILE_PATH`: (Optional) Path to a file where verbose (DEBUG level) logs will be written. If not specified, logs (INFO level and above for FrameShift's own messages, plus any output from underlying libraries) are printed to the console.
-*   `--test`: (Flag, default: `False`) Run in test mode. This will execute a predefined suite of scenarios based on the provided `input`, `output`, and `ratio` arguments, varying other parameters like padding, interpolation, etc. Test outputs are saved to a subdirectory (e.g., `*_test_outputs/`) relative to the specified output path. A detailed log of the test suite is also generated (e.g., `*_test_suite.log`).
-*   `--batch`: (Flag) Process all videos in the input directory.
+Python 3.8+ required.
 
-The cropping logic determines an optimal stationary (fixed) crop for each scene, prioritizing important content based on `--object_weights`. How this crop is presented in the final output (filled, or with padding) is controlled by `--padding` and its related arguments.
+```bash
+git clone https://github.com/fralapo/FrameShift.git
+cd FrameShift
+pip install -r requirements.txt
+```
 
-## Graphical User Interface (GUI)
+FFmpeg is optional but needed to keep audio. Install it from [ffmpeg.org](https://ffmpeg.org/download.html) and make sure `ffmpeg` is on your `PATH`:
 
-For users who prefer a graphical interface over the command line, FrameShift now includes a GUI.
+```bash
+ffmpeg -version
+```
 
-*   **To Run:**
-    ```bash
-    python frameshift_gui.py
-    ```
-    (Ensure you are in the project's root directory and have installed all dependencies from `requirements.txt`).
-*   **Features:** The GUI provides access to most of FrameShift's command-line functionalities, including input/output selection, aspect ratio, padding options, object weights, and more, all through an intuitive interface.
-*   **Documentation:** For detailed instructions on using the GUI, please refer to the [FrameShift GUI User Manual](FRAMESHIFT_GUI_MANUAL.md).
+The two detection models (~11 MB total) download on the first run and are verified by SHA-256 before use.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Quick start (CLI)
+
+Landscape to 9:16, cropped to fill the frame:
+
+```bash
+python -m frameshift.main input.mp4 output.mp4 --ratio 9:16
+```
+
+Fit the whole crop with black bars instead of cropping to fill:
+
+```bash
+python -m frameshift.main input.mp4 output.mp4 --ratio 1:1 --padding
+```
+
+Blurred bars instead of black (`--blur_amount` 0–10):
+
+```bash
+python -m frameshift.main input.mp4 output.mp4 --ratio 16:9 --padding --padding_type blur --blur_amount 5
+```
+
+Solid-colour bars (name or `(R,G,B)`):
+
+```bash
+python -m frameshift.main input.mp4 output.mp4 --ratio 4:3 --padding --padding_type color --padding_color_value "(0,0,255)"
+```
+
+Batch a folder:
+
+```bash
+python -m frameshift.main videos/ out/ --ratio 4:5 --batch
+```
+
+Each output's filename gets a `_reframed` suffix in batch mode.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## GUI
+
+There's a Tkinter front-end covering most CLI options — input/output, ratio, padding, object weights, with a cancel button for long jobs.
+
+```bash
+python frameshift_gui.py
+```
+
+Full walkthrough: [FRAMESHIFT_GUI_MANUAL.md](FRAMESHIFT_GUI_MANUAL.md).
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Command-line options
+
+| Option | Default | What it does |
+|---|---|---|
+| `input` | — | Input file, or directory with `--batch` |
+| `output` | — | Output file, or directory with `--batch` |
+| `--ratio` | `9/16` | Target aspect ratio: `9:16`, `1:1`, or a decimal like `0.5625` |
+| `--padding` | off | Fit the crop inside the frame with bars instead of cropping to fill |
+| `--padding_type` | `black` | `black`, `blur`, or `color` (needs `--padding`) |
+| `--blur_amount` | `5` | Blur strength 0–10 when `--padding_type blur` |
+| `--padding_color_value` | `black` | Bar colour name or `"(R,G,B)"` when `--padding_type color` |
+| `--output_height` | `1080` | Output height in px; width follows from `--ratio` |
+| `--interpolation` | `lanczos` | `nearest`, `linear`, `cubic`, `area`, `lanczos` |
+| `--content_opacity` | `1.0` | Below 1.0, blends content over a blurred full-frame background |
+| `--object_weights` | `face:1.0,person:0.8,default:0.5` | Per-class importance — see below |
+| `--log_file` | none | Write DEBUG logs to a file |
+| `--test` | off | Run a built-in sweep of scenarios against one input |
+| `--batch` | off | Process every video in the input directory |
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Object weights
+
+`--object_weights` decides what the crop chases. Higher weight = pulls the crop harder toward that class.
+
+```bash
+# Keep dogs in frame, care less about everything else
+python -m frameshift.main in.mp4 out.mp4 --object_weights "face:1.0,dog:0.7,default:0.2"
+```
+
+- `face` is the dedicated face model (or MediaPipe fallback).
+- Any [COCO class](https://github.com/ultralytics/ultralytics) — `person`, `car`, `dog`, `bottle`, etc. — comes from `yolo11n.pt`.
+- The object model only runs when at least one non-face class has weight > 0, so the default face-and-person setup never loads it.
+- `default` covers any detected class you didn't name.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Limitations
+
+Worth knowing before you rely on it:
+
+- **One crop per scene.** No tracking or panning inside a shot. A subject that walks across a long take can leave the frame.
+- **Output codec is `mp4v`.** Fine for previews, not the smallest or highest-quality option; re-encode with FFmpeg if you need H.264/H.265.
+- **Dependencies are unpinned** in `requirements.txt`. Ultralytics and MediaPipe change APIs between releases, so a fresh install can pull a version that behaves differently. Pin them if you need reproducibility.
+- **`--test` is an output generator, not an assertion suite** — it renders scenarios for you to eyeball, it doesn't pass/fail.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Contributing
+
+Issues and pull requests welcome at [github.com/fralapo/FrameShift](https://github.com/fralapo/FrameShift). If you hit a reframing result that looks wrong, attaching the input clip (or a short sample) makes it much easier to reproduce.
+
+Ideas on the table: in-shot tracking/panning as an opt-in mode, configurable output codec, pinned dependencies.
 
 ## License
 
-FrameShift is released under the MIT License.
+MIT. See [LICENSE](LICENSE).
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+[license-shield]: https://img.shields.io/github/license/fralapo/FrameShift?style=for-the-badge
+[license-url]: LICENSE
+[python-shield]: https://img.shields.io/badge/Python-3.8%2B-3776AB?style=for-the-badge&logo=python&logoColor=white
+[python-url]: https://www.python.org/
+[last-commit-shield]: https://img.shields.io/github/last-commit/fralapo/FrameShift?style=for-the-badge
+[last-commit-url]: https://github.com/fralapo/FrameShift/commits/main
+[stars-shield]: https://img.shields.io/github/stars/fralapo/FrameShift?style=for-the-badge
+[stars-url]: https://github.com/fralapo/FrameShift/stargazers
+[issues-shield]: https://img.shields.io/github/issues/fralapo/FrameShift?style=for-the-badge
+[issues-url]: https://github.com/fralapo/FrameShift/issues

@@ -4,3 +4,10 @@ __pycache__/
 *.pyd
 .env
 env/
+
+# Auto-downloaded detection models (verified at runtime by SHA-256)
+models/
+*.part
+
+# Editor / backup artifacts
+*.bak

@@ -1,16 +1,140 @@
 """Utilities for face and object detection."""
-from typing import List, Tuple, Dict, Any, Set
+from typing import List, Tuple, Dict, Any, Set, Optional
 import cv2
 from pathlib import Path
 import requests
 import numpy as np
 import mediapipe as mp
 from ultralytics import YOLO
-from huggingface_hub import hf_hub_download
-from urllib.parse import urlparse
+import hashlib
+import os
 import logging
 
 logger = logging.getLogger('frameshift.utils.detection')
+
+# Network timeout for model downloads (seconds). Without this requests can hang
+# forever on a stalled connection.
+MODEL_DOWNLOAD_TIMEOUT = 60
+
+# Pinned model sources with SHA-256 digests of the trusted release artifacts.
+#
+# A PyTorch ".pt" file is a pickle archive; YOLO() ultimately unpickles it, which
+# is equivalent to executing arbitrary code. Every file is therefore verified
+# against the digest below BEFORE it is ever handed to YOLO() -- whether it was
+# just downloaded or was already sitting in the models/ directory. A mismatched
+# or corrupt file is deleted and never loaded.
+MODEL_REGISTRY: Dict[str, Dict[str, str]] = {
+    "yolo11n.pt": {
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
+        "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
+    },
+    "yolov11n-face.pt": {
+        "url": "https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt",
+        "sha256": "9420a9d4933940d2202f511d45df1750e3c1546dd9efc7a3985caae3bbbf7ed2",
+    },
+}
+
+
+def _sha256_of_file(path: Path) -> str:
+    """Return the hex SHA-256 of a file, read in chunks to bound memory use."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ensure_verified_model(filename: str, model_dir: Path) -> Optional[Path]:
+    """
+    Return a path to a SHA-256-verified local copy of ``filename``, or ``None``
+    if it cannot be obtained and verified.
+
+    The returned path is safe to hand to ``YOLO()``: an existing local file is
+    trusted only when its digest matches the pinned value, and a freshly
+    downloaded file is verified before being moved into place. Any file that
+    fails verification is removed rather than loaded.
+    """
+    if filename not in MODEL_REGISTRY:
+        logger.error(f"No pinned source/digest for model '{filename}'. Refusing to load.")
+        return None
+
+    spec = MODEL_REGISTRY[filename]
+    expected = spec["sha256"].lower()
+    dest = model_dir / filename
+
+    # Trust an already-present file only if its digest matches.
+    if dest.is_file():
+        try:
+            actual = _sha256_of_file(dest)
+        except OSError as e:
+            logger.error(f"Could not read local '{dest}' for verification: {e}")
+            return None
+        if actual.lower() == expected:
+            logger.info(f"Verified existing model '{filename}'.")
+            return dest
+        logger.warning(
+            f"Local '{filename}' failed integrity check (expected {expected[:12]}..., "
+            f"got {actual[:12]}...). Discarding and re-downloading."
+        )
+        try:
+            dest.unlink()
+        except OSError as e:
+            logger.error(f"Could not remove untrusted file '{dest}': {e}. Refusing to load.")
+            return None
+
+    # Download to a temporary file, verify, then atomically move into place so a
+    # partial or tampered download can never be picked up on a later run.
+    tmp = dest.with_name(dest.name + ".part")
+    logger.info(f"Downloading '{filename}' from {spec['url']} ...")
+    try:
+        with requests.get(spec["url"], stream=True, timeout=MODEL_DOWNLOAD_TIMEOUT) as response:
+            response.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    except Exception as e:
+        logger.error(f"Download of '{filename}' failed: {e}", exc_info=True)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    try:
+        actual = _sha256_of_file(tmp)
+    except OSError as e:
+        logger.error(f"Could not read downloaded '{tmp}' for verification: {e}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    if actual.lower() != expected:
+        logger.error(
+            f"Downloaded '{filename}' failed integrity check (expected {expected[:12]}..., "
+            f"got {actual[:12]}...). Discarding."
+        )
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    try:
+        os.replace(tmp, dest)
+    except OSError as e:
+        logger.error(f"Could not finalize '{dest}': {e}")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    logger.info(f"Verified and installed '{filename}'.")
+    return dest
 
 
 class Detector:
@@ -30,77 +154,37 @@ class Detector:
         model_dir = Path("models")
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load general object detection model (yolo11n.pt)
+        # Load general object detection model (yolo11n.pt). ensure_verified_model
+        # downloads if needed and only returns a path whose SHA-256 matches the
+        # pinned digest, so an untrusted/corrupt file is never loaded.
         self.obj_model = None
-        obj_model_filename = "yolo11n.pt"
-        obj_model_url = "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt" # Corrected Ultralytics assets URL
-        local_obj_model_path = model_dir / obj_model_filename
-
-        if not local_obj_model_path.is_file():
-            logger.info(f"'{obj_model_filename}' not found locally at {local_obj_model_path}. Attempting to download from {obj_model_url}...")
+        obj_model_path = ensure_verified_model("yolo11n.pt", model_dir)
+        if obj_model_path is not None:
             try:
-                response = requests.get(obj_model_url, stream=True)
-                response.raise_for_status()
-                with open(local_obj_model_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                logger.info(f"Successfully downloaded '{obj_model_filename}' to {local_obj_model_path}")
-            except Exception as e_download_obj:
-                logger.error(f"Could not download '{obj_model_filename}' from {obj_model_url}: {e_download_obj}. Object detection might not work.", exc_info=True)
-                # self.obj_model remains None
-
-        if local_obj_model_path.is_file() and self.obj_model is None: # Attempt to load if downloaded or already exists
-            try:
-                self.obj_model = YOLO(str(local_obj_model_path))
-                logger.info(f"Successfully loaded general object model from {local_obj_model_path}.")
+                self.obj_model = YOLO(str(obj_model_path))
+                logger.info(f"Successfully loaded general object model from {obj_model_path}.")
             except Exception as e_load_obj:
-                logger.error(f"Could not load general object model from {local_obj_model_path}: {e_load_obj}. Object detection might not work.", exc_info=True)
-                self.obj_model = None # Ensure it's None if loading fails
-        elif not local_obj_model_path.is_file():
-            logger.error(f"General object model '{obj_model_filename}' not found at {local_obj_model_path} and download failed or was not attempted. Object detection will be unavailable.")
+                logger.error(f"Could not load general object model from {obj_model_path}: {e_load_obj}. Object detection might not work.", exc_info=True)
+                self.obj_model = None
+        else:
+            logger.error("General object model unavailable (download or integrity check failed). Object detection will be unavailable.")
 
 
         # Attempt to load specialized YOLO face detection model (yolov11n-face.pt)
         self.yolo_face_model = None
         self.mp_face_model = None
 
-        face_model_filename = "yolov11n-face.pt"
-        # Define the URL for the face model on GitHub
-        face_model_url = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov11n-face.pt"
-
-        # Determine the local path where the model should be stored (now using model_dir)
-        # model_dir is already defined and created above: Path("models")
-        local_face_model_path = model_dir / face_model_filename # Changed from local_model_path
-
-        # Check if the file exists locally
-        if not local_face_model_path.is_file():
-            logger.info(f"'{face_model_filename}' not found locally at {local_face_model_path}. Attempting to download from {face_model_url}...")
+        face_model_path = ensure_verified_model("yolov11n-face.pt", model_dir)
+        if face_model_path is not None:
             try:
-                # Download the file from the URL using requests
-                # import requests # Already imported at the top of the file
-                response = requests.get(face_model_url, stream=True)
-                response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
-                with open(local_face_model_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                logger.info(f"Successfully downloaded '{face_model_filename}' to {local_face_model_path}")
-
-            except Exception as e_download_face: # Renamed e_download to avoid conflict if in same scope later
-                logger.warning(f"Could not download '{face_model_filename}' from {face_model_url}: {e_download_face}")
-                # local_face_model_path remains valid path, but file won't exist if download failed
-
-        # Attempt to load the YOLO face model from the local path (if determined and exists)
-        if local_face_model_path.is_file(): # Check again if file exists (it might have been downloaded)
-            try:
-                logger.info(f"Attempting to load YOLO face model from {local_face_model_path}...")
-                # Use str() to ensure compatibility with YOLO() which might expect a string path
-                self.yolo_face_model = YOLO(str(local_face_model_path))
-                logger.info(f"Successfully loaded YOLO face model from {local_face_model_path}.")
-            except Exception as e_load_face: # Renamed e_load
-                logger.warning(f"Could not load YOLO face model from {local_face_model_path}: {e_load_face}")
-                self.yolo_face_model = None # Ensure model is None if loading fails
-        else: # File does not exist (either wasn't there initially or download failed)
-            logger.warning(f"YOLO face model file not found at {local_face_model_path}. Face detection with YOLO will be unavailable.")
+                logger.info(f"Attempting to load YOLO face model from {face_model_path}...")
+                self.yolo_face_model = YOLO(str(face_model_path))
+                logger.info(f"Successfully loaded YOLO face model from {face_model_path}.")
+            except Exception as e_load_face:
+                logger.warning(f"Could not load YOLO face model from {face_model_path}: {e_load_face}")
+                self.yolo_face_model = None
+        else:
+            logger.warning("YOLO face model unavailable (download or integrity check failed). Face detection with YOLO will be unavailable.")
             self.yolo_face_model = None
 
 
